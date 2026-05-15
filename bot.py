@@ -9,13 +9,25 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# Carica knowledge base una volta sola all'avvio
+# Whitelist di utenti autorizzati
+ALLOWED_USER_IDS = {
+    int(uid.strip())
+    for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    if uid.strip()
+}
+
+if not ALLOWED_USER_IDS:
+    log.warning("ALLOWED_USER_IDS is empty! Bot will reject all users.")
+else:
+    log.info(f"Bot autorizzato per {len(ALLOWED_USER_IDS)} utenti")
+
+# Carica knowledge base una volta sola
 KB_DIR = Path(__file__).parent / "docs"
 knowledge = "\n\n---\n\n".join(
     f"# FILE: {f.name}\n\n{f.read_text(encoding='utf-8')}"
     for f in sorted(KB_DIR.glob("*.md"))
 )
-log.info(f"Caricati {len(list(KB_DIR.glob('*.md')))} documenti dalla knowledge base")
+log.info(f"Caricati {len(list(KB_DIR.glob('*.md')))} documenti")
 
 SYSTEM_INSTRUCTION = f"""Sei un assistente per padroni di cuccioli di labrador alle prime armi.
 
@@ -37,10 +49,35 @@ REGOLE:
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 MODEL = "gemini-2.5-flash"
 
-# Storia conversazioni in memoria, per chat_id
 conversations: dict[int, list] = {}
 
+
+def is_authorized(update: Update) -> bool:
+    """Controlla se l'utente è nella whitelist."""
+    user = update.effective_user
+    if user is None:
+        return False
+    return user.id in ALLOWED_USER_IDS
+
+
+async def reject_unauthorized(update: Update) -> None:
+    """Risponde all'utente non autorizzato e logga il tentativo."""
+    user = update.effective_user
+    log.warning(
+        f"Tentativo di accesso non autorizzato: "
+        f"id={user.id} username=@{user.username} name={user.full_name}"
+    )
+    await update.message.reply_text(
+        "Questo bot è in fase di test privato. "
+        "Se pensi di dover avere accesso, contatta l'amministratore."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await reject_unauthorized(update)
+        return
+
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
     await update.message.reply_text(
@@ -50,19 +87,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Per emergenze rivolgiti sempre al veterinario."
     )
 
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await reject_unauthorized(update)
+        return
+
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
     await update.message.reply_text("Conversazione resettata.")
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await reject_unauthorized(update)
+        return
+
     chat_id = update.effective_chat.id
     user_msg = update.message.text
 
     history = conversations.setdefault(chat_id, [])
     history.append({"role": "user", "parts": [{"text": user_msg}]})
-
-    # Tieni ultimi 20 turni
     history_trimmed = history[-20:]
 
     try:
@@ -80,14 +125,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = response.text
         history.append({"role": "model", "parts": [{"text": reply}]})
-
         await update.message.reply_text(reply)
 
-    except Exception as e:
+    except Exception:
         log.exception("Errore Gemini")
         await update.message.reply_text(
             "Mi dispiace, c'è stato un problema. Riprova tra qualche secondo."
         )
+
 
 def main():
     app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).build()
@@ -96,6 +141,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot avviato")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
